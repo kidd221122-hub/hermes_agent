@@ -16,15 +16,11 @@ USER_AGENTS = [
 ]
 
 def get_safe_headers():
-    """專為 Docker 環境設計的終極網頁偽裝，徹底擊碎 406 阻擋"""
+    """隨機產生一個模仿真實瀏覽器的 Header，規避 403/406 限制"""
     return {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",  # 🌟 強制宣告網頁壓縮格式（Docker 預設會漏掉）
-        "Connection": "keep-alive",              # 🌟 模擬正常瀏覽器的持續連線
-        "Cache-Control": "max-age=0",
-        "Upgrade-Insecure-Requests": "1",        # 🌟 模擬從安全網頁跳轉的特徵
+        "Accept-Language": "en-US,en;q=0.9,zh-TW;q=0.8,zh;q=0.7",
         "Origin": "https://mlb.com",
         "Referer": "https://mlb.com/"
     }
@@ -225,89 +221,94 @@ def get_games_by_date(game_date):
     輸入日期 (格式: 'YYYY-MM-DD')，取得當天所有 MLB 比賽數據。
     """
     domain = "statsapi.mlb.com"
-    path = "/api/v1/schedule"
-    url = f"https://{domain}{path}"
-    
-    # 🔥 關鍵升級 1：除了原本的裝載，額外要求 decisions(勝敗投) 與人名結構
-    params = {
+    # 🌟 步驟 1：只抓基本賽程，完全不帶任何 hydrate 參數，確保 100% 不噴 406
+    schedule_url = f"https://{domain}/api/v1/schedule"
+    schedule_params = {
         "sportId": 1,
-        "date": game_date,
-        "hydrate": "team,lineups,probablePitcher,decisions,person"
+        "date": game_date
     }
     
     try:
-        random_delay(1, 2)
-        response = requests.get(url, params=params, headers=get_safe_headers(), timeout=10)
-    except requests.exceptions.RequestException as e:
-        print(f"❌ 網路連線失敗: {e}")
-        return None
-        
-    if response.status_code != 200:
-        print(f"❌ API 請求失敗，狀態碼: {response.status_code}")
-        return None
-        
-    try:
-        data = response.json()
+        # 這裡會以極輕量的方式安全通過大聯盟防火牆
+        response = requests.get(schedule_url, params=schedule_params, headers=get_safe_headers(), timeout=12)
+        if response.status_code != 200:
+            print(f"❌ 賽程基本 API 請求失敗，狀態碼: {response.status_code}")
+            return None
+        schedule_data = response.json()
     except Exception as e:
-        print(f"❌ 解析比賽 JSON 失敗: {e}")
+        print(f"❌ 抓取基本賽程時發生異常: {e}")
         return None
         
-    dates = data.get("dates", [])
+    dates = schedule_data.get("dates", [])
     if not dates:
-        print(f"📅 日期 {game_date} 沒有安排任何比賽。")
-        return None
+        return pd.DataFrame() # 當天無賽事
         
     games_list = []
-    # 處理資料層級
-    games = dates[0].get("games", []) if isinstance(dates, list) and len(dates) > 0 else dates.get("games", [])
+    base_games = dates[0].get("games", [])
     
-    for game in games:
-        teams = game.get("teams", {})
-        away = teams.get("away", {})
-        home = teams.get("home", {})
+    print(f"   [Docker 備援防禦啟動] 成功獲取基本賽程，開始穿透 {len(base_games)} 場比賽的 Boxscore 數據...")
+    
+    # 🌟 步驟 2：疊代每場比賽，呼叫獨立的 Boxscore 端點抓取先發投手
+    for idx, base_game in enumerate(base_games):
+        game_id = base_game.get("gamePk")
+        teams = base_game.get("teams", {})
+        away_team = teams.get("away", {})
+        home_team = teams.get("home", {})
         
-        # 1. 嘗試原有的賽前預計先發撈法 (Probable Pitcher)
-        probable = game.get("probablePitchers", {})
-        away_pitcher_name = probable.get("away", {}).get("fullName")
-        away_pitcher_id = probable.get("away", {}).get("id")
-        home_pitcher_name = probable.get("home", {}).get("fullName")
-        home_pitcher_id = probable.get("home", {}).get("id")
+        # 預設先發投手資訊
+        away_pitcher_name, away_pitcher_id = "TBD", 0
+        home_pitcher_name, home_pitcher_id = "TBD", 0
         
-        # 2. 🔥 關鍵升級 2：歷史備援機制 (若預報是空的，改從 decisions 撈取紀錄)
-        decisions = game.get("decisions", {})
+        # 呼叫單場 boxscore 輕量端點，這個端點無防護，Docker 可直接讀取
+        boxscore_url = f"https://{domain}/api/v1/game/{game_id}/boxscore"
         
-        if not away_pitcher_id and decisions:
-            # 嘗試從 decisions 撈取記錄
-            p_data = decisions.get("winner") if decisions.get("winner", {}).get("team", {}).get("id") == away.get("team", {}).get("id") else decisions.get("loser")
-            if not p_data: p_data = decisions.get("save")
-            if p_data:
-                away_pitcher_name = p_data.get("fullName")
-                away_pitcher_id = p_data.get("id")
+        try:
+            # 這裡給予極短的隨機微幅等待（0.2 ~ 0.5 秒），確保極速穿透又不會過於密集
+            time.sleep(random.uniform(0.2, 0.5))
+            
+            box_res = requests.get(boxscore_url, headers=get_safe_headers(), timeout=10)
+            if box_res.status_code == 200:
+                box_data = box_res.json()
+                box_teams = box_data.get("teams", {})
+                
+                # 穿透客隊先發資訊
+                away_box = box_teams.get("away", {})
+                away_pitchers_list = away_box.get("pitchers", [])
+                if away_pitchers_list:
+                    # 陣列中的第一個 ID 就是這場比賽當天實際登板的先發投手！
+                    first_away_pitcher_id = away_pitchers_list[0]
+                    player_info = away_box.get("players", {}).get(f"ID{first_away_pitcher_id}", {}).get("person", {})
+                    away_pitcher_id = first_away_pitcher_id
+                    away_pitcher_name = player_info.get("fullName", "TBD")
+                    
+                # 穿透主隊先發資訊
+                home_box = box_teams.get("home", {})
+                home_pitchers_list = home_box.get("pitchers", [])
+                if home_pitchers_list:
+                    first_home_pitcher_id = home_pitchers_list[0]
+                    player_info = home_box.get("players", {}).get(f"ID{first_home_pitcher_id}", {}).get("person", {})
+                    home_pitcher_id = first_home_pitcher_id
+                    home_pitcher_name = player_info.get("fullName", "TBD")
+        except Exception as e:
+            # 若單場 boxscore 卡頓，優雅降級跳過先發投手名字，確保整張大表不崩潰
+            pass
 
-        if not home_pitcher_id and decisions:
-            p_data = decisions.get("winner") if decisions.get("winner", {}).get("team", {}).get("id") == home.get("team", {}).get("id") else decisions.get("loser")
-            if not p_data: p_data = decisions.get("save")
-            if p_data:
-                home_pitcher_name = p_data.get("fullName")
-                home_pitcher_id = p_data.get("id")
-
-        # 3. 🔥 終極保險：若仍無資料(如尚未公布)，以 "TBD" (待定) 填補
-        game_dict = {
+        # 組合出完全符合您 Google Sheet 格式的 13 個完整欄位
+        games_list.append({
             "Game_Date": game_date,
-            "Game_ID": game.get("gamePk"),
-            "Away_Team_Name": away.get("team", {}).get("name"),
-            "Home_Team_Name": home.get("team", {}).get("name"),
-            "Away_Started_Pitcher_Name": away_pitcher_name if away_pitcher_name else "TBD",
-            "Away_Started_Pitcher_ID": away_pitcher_id if away_pitcher_id else 0,
-            "Home_Started_Pitcher_Name": home_pitcher_name if home_pitcher_name else "TBD",
-            "Home_Started_Pitcher_ID": home_pitcher_id if home_pitcher_id else 0,
-            "Away_Score": away.get("score", 0),
-            "Home_Score": home.get("score", 0),
-            "Game_State": game.get("status", {}).get("detailedState"),
-            "Venue_Name": game.get("venue", {}).get("name"),
-            "Start_Time_UTC": game.get("gameDate")
-        }
-        games_list.append(game_dict)
+            "Game_ID": game_id,
+            "Away_Team_Name": away_team.get("team", {}).get("name"),
+            "Home_Team_Name": home_team.get("team", {}).get("name"),
+            "Away_Started_Pitcher_Name": away_pitcher_name,
+            "Away_Started_Pitcher_ID": int(away_pitcher_id),
+            "Home_Started_Pitcher_Name": home_pitcher_name,
+            "Home_Started_Pitcher_ID": int(home_pitcher_id),
+            "Away_Score": away_team.get("score", 0),
+            "Home_Score": home_team.get("score", 0),
+            "Game_State": base_game.get("status", {}).get("detailedState"),
+            "Venue_Name": base_game.get("venue", {}).get("name"),
+            "Start_Time_UTC": base_game.get("gameDate")
+        })
         
     return pd.DataFrame(games_list)
 

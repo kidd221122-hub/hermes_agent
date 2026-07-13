@@ -16,11 +16,15 @@ USER_AGENTS = [
 ]
 
 def get_safe_headers():
-    """隨機產生一個模仿真實瀏覽器的 Header，規避 403/406 限制"""
+    """專為 Docker 環境設計的終極網頁偽裝，徹底擊碎 406 阻擋"""
     return {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9,zh-TW;q=0.8,zh;q=0.7",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",  # 🌟 強制宣告網頁壓縮格式（Docker 預設會漏掉）
+        "Connection": "keep-alive",              # 🌟 模擬正常瀏覽器的持續連線
+        "Cache-Control": "max-age=0",
+        "Upgrade-Insecure-Requests": "1",        # 🌟 模擬從安全網頁跳轉的特徵
         "Origin": "https://mlb.com",
         "Referer": "https://mlb.com/"
     }

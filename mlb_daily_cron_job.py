@@ -4,7 +4,7 @@
 #     "oauth2client",
 #     "pandas",
 #     "pytz",
-#     "pybaseball",
+#     "ServiceAccountCredentials",
 # ]
 # ///
 
@@ -16,8 +16,6 @@ from oauth2client.service_account import ServiceAccountCredentials
 import pandas as pd
 import pytz
 import requests
-import pybaseball
-from pybaseball import statsapi
 import sys
 
 USER_AGENTS = [
@@ -129,112 +127,64 @@ def upsert_to_google_sheet_hybrid(spreadsheet_id, sheet_name, df, id_column_name
         print(f"❌ 同步到 Google Sheet ({sheet_name}) 失敗: {e}")
 
 
-def get_games_by_date(game_date):
-    """
-    輸入日期 (格式: 'YYYY-MM-DD')，使用 pybaseball 取得當天所有 MLB 比賽數據與先發投手。
-    """
-    try:
-        # 使用 pybaseball 封裝的 schedule，它能更穩定地拿到當天賽程資料
-        raw_games = statsapi.schedule(date=game_date)
-    except Exception as e:
-        print(f"❌ 透過 pybaseball 抓取賽程時發生異常: {e}")
-        return None
-        
-    if not raw_games:
-        return pd.DataFrame() # 當天無賽事
-        
-    games_list = []
-    print(f"   成功獲取基本賽程，開始穿透 {len(raw_games)} 場比賽的詳細 Boxscore 數據...")
-    
-    for game in raw_games:
-        game_id = game.get("game_id")
-        
-        # 預設先發投手資訊
-        away_pitcher_name, away_pitcher_id = "TBD", 0
-        home_pitcher_name, home_pitcher_id = "TBD", 0
-        
-        try:
-            # 引入微小延遲防禦，配合 pybaseball 的內建機制避免被限速
-            time.sleep(random.uniform(0.1, 0.3))
-            
-            # 使用 pybaseball 的 boxscore_data 獲取對決名單
-            box = statsapi.boxscore_data(game_id)
-            
-            # 讀取客隊先發投手 (陣列第一位即為先發)
-            away_pitchers = box.get("away", {}).get("pitchers", [])
-            if away_pitchers:
-                away_pitcher_id = away_pitchers[0]
-                away_pitcher_name = box.get("away", {}).get("players", {}).get(f"ID{away_pitcher_id}", {}).get("person", {}).get("fullName", "TBD")
-                
-            # 讀取主隊先發投手
-            home_pitchers = box.get("home", {}).get("pitchers", [])
-            if home_pitchers:
-                home_pitcher_id = home_pitchers[0]
-                home_pitcher_name = box.get("home", {}).get("players", {}).get(f"ID{home_pitcher_id}", {}).get("person", {}).get("fullName", "TBD")
-        except Exception:
-            # 遇到單場 boxscore 異常時優雅跳過，確保大表完整
-            pass
-
-        # 組合出完全符合您 Google Sheet 格式的 13 個完整欄位
-        games_list.append({
-            "Game_Date": game_date,
-            "Game_ID": game_id,
-            "Away_Team_Name": game.get("away_name"),
-            "Home_Team_Name": game.get("home_name"),
-            "Away_Started_Pitcher_Name": away_pitcher_name,
-            "Away_Started_Pitcher_ID": int(away_pitcher_id),
-            "Home_Started_Pitcher_Name": home_pitcher_name,
-            "Home_Started_Pitcher_ID": int(home_pitcher_id),
-            "Away_Score": game.get("away_score", 0),
-            "Home_Score": game.get("home_score", 0),
-            "Game_State": game.get("status"),
-            "Venue_Name": game.get("venue_name"),
-            "Start_Time_UTC": game.get("game_datetime")
-        })
-        
-    return pd.DataFrame(games_list)
-
-
 def get_pitcher_stats(pitcher_id, season=2023):
     """
-    輸入投手 ID，使用 pybaseball 取得該賽季的單季標準及進階數據統計。
+    輸入投手 ID，取得該賽季的生涯/年度進階數據統計。
     """
+    domain = "statsapi.mlb.com"
+    path = f"/api/v1/people/{pitcher_id}/stats"
+    url = f"https://{domain}{path}"
+    
+    params = {
+        "stats": "seasonAdvanced",
+        "group": "pitching",
+        "season": season
+    }
+    
     try:
-        # 使用 pybaseball.statsapi 獲取標準單季與進階數據
-        std_data = statsapi.player_stat_data(pitcher_id, group="pitching", type="statsSingleSeason")
-        adv_data = statsapi.player_stat_data(pitcher_id, group="pitching", type="seasonAdvanced")
+        random_delay(1.5, 3)
+        adv_response = requests.get(url, params=params, headers=get_safe_headers(), timeout=10)
+        random_delay(0.5, 1.5)
+        params["stats"] = "statsSingleSeason"
+        std_response = requests.get(url, params=params, headers=get_safe_headers(), timeout=10)
+    except requests.exceptions.RequestException as e:
+        print(f"❌ 網路連線失敗: {e}")
+        raise e
         
-        std_stats = {}
-        if std_data and "stats" in std_data:
-            for split in std_data["stats"]:
-                if str(split.get("season")) == str(season):
-                    std_stats = split.get("stats", {})
-                    break
-                    
-        adv_stats = {}
-        if adv_data and "stats" in adv_data:
-            for split in adv_data["stats"]:
-                if str(split.get("season")) == str(season):
-                    adv_stats = split.get("stats", {})
-                    break
+    if adv_response.status_code != 200 or std_response.status_code != 200:
+        print(f"❌ 無法取得投手數據。狀態碼: {adv_response.status_code}")
+        raise e
         
-        if not std_stats:
-            print(f"⚠️ pybaseball 找不到該投手在 {season} 賽季的數據")
+    try:
+        adv_json = adv_response.json()
+        std_json = std_response.json()
+        
+        # 安全檢查：確認 stats 存在且有內容
+        if "stats" not in std_json or not std_json["stats"] or not std_json["stats"][0].get("splits"):
+            print(f"⚠️ 找不到該投手在 {season} 賽季的數據")
             return None
             
-        # 提取球員基本資訊
-        player_name = std_data.get("first_name", "") + " " + std_data.get("last_name", "")
+        # 🔥 修正點：從第一層 stats 陣列的第一個元素中，抓取 splits 陣列的第一筆數據
+        std_splits = std_json["stats"][0]["splits"][0]
+        std_stats = std_splits.get("stat", {})
+        player_info = std_splits.get("player", {})
         
-        # 獲取投球慣用手 (L/R)
-        pitch_hand = "R"
-        try:
-            # pybaseball 可以直接調用 player_thumbnail_data 來解析球員基本檔案
-            thumb = statsapi.player_thumbnail_data(pitcher_id)
-            # 若結構中有直接提供，可由對應欄位取得
-        except:
-            pass
+        # 安全抓取進階數據的對應層級
+        adv_stats = {}
+        if "stats" in adv_json and adv_json["stats"] and adv_json["stats"][0].get("splits"):
+            adv_stats = adv_json["stats"][0]["splits"][0].get("stat", {})
+        
+        # 1. 處理投球慣用手
+        pitch_hand = player_info.get("pitchHand", {}).get("code")
+        if not pitch_hand:
+            try:
+                p_url = f"https://{domain}/api/v1/people/{pitcher_id}"
+                p_res = requests.get(p_url, timeout=5).json()
+                pitch_hand = p_res.get("people", [{}])[0].get("pitchHand", {}).get("code", "R")
+            except:
+                pitch_hand = "R"
 
-        # 安全由標準數據計算 K% 與 BB%，確保格式美觀且準確
+        # 2. 直接由標準數據計算 K% 與 BB%，避開 API 欄位改名的風險
         bf = std_stats.get("battersFaced", 0)
         so = std_stats.get("strikeOuts", 0)
         bb = std_stats.get("baseOnBalls", 0)
@@ -246,7 +196,7 @@ def get_pitcher_stats(pitcher_id, season=2023):
             k_rate = "0.0%"
             bb_rate = "0.0%"
 
-        # 處理 BABIP (優先嘗試進階數據，若無則代入標準公式計算)
+        # 3. 處理 BABIP (若進階數據抓不到，使用標準數據公式計算)
         babip_val = adv_stats.get("babip")
         if not babip_val:
             h = std_stats.get("hits", 0)
@@ -255,14 +205,12 @@ def get_pitcher_stats(pitcher_id, season=2023):
             sf = std_stats.get("sacFlies", 0)
             denom = (ab - so - hr + sf)
             babip_val = f"{(h - hr) / denom:.3f}" if denom > 0 else ".000"
-        elif isinstance(babip_val, (int, float)):
-            babip_val = f"{babip_val:.3f}"
 
         pitcher_dict = {
             "PitcherId": pitcher_id,
-            "PitcherName": player_name if player_name.strip() else "Unknown Player",
-            "TeamId": std_data.get("current_team_id"),
-            "TeamName": std_data.get("current_team"),
+            "PitcherName": player_info.get("fullName", "Unknown Player"),
+            "TeamId": std_splits.get("team", {}).get("id"),
+            "TeamName": std_splits.get("team", {}).get("name"),
             "pitchHand": pitch_hand,
             "GamesStarted": std_stats.get("gamesStarted"),
             "GamesPlayed": std_stats.get("gamesPlayed"),
@@ -270,14 +218,182 @@ def get_pitcher_stats(pitcher_id, season=2023):
             "TotalBattersFaced": bf,
             "K%": k_rate,
             "BB%": bb_rate,
-            "WHIP": f"{std_stats.get('whip', 0.0):.2f}" if std_stats.get('whip') else ".00",
+            "WHIP": std_stats.get("whip"),
             "BABIP": babip_val
         }
         return pd.DataFrame([pitcher_dict])
-        
     except Exception as e:
-        print(f"⚠️ 透過 pybaseball 解析投手數據失敗: {e}")
+        print(f"⚠️ 投手數據欄位解析失敗: {e}")
         return None
+
+import time
+import random
+import requests
+import pandas as pd
+
+def get_games_by_date(game_date):
+    """
+    輸入日期 (格式: 'YYYY-MM-DD')，取得當天所有 MLB 比賽數據。
+    含先發投手、即時局數狀態，以及雙方先發投手的當場投球數據(IP, H, ER, K, BB)。
+    """
+    domain = "statsapi.mlb.com"
+    
+    # 🌟 步驟 1：只抓基本賽程，完全不帶任何 hydrate 參數，確保 100% 不噴 406
+    schedule_url = f"https://{domain}/api/v1/schedule"
+    schedule_params = {
+        "sportId": 1,
+        "date": game_date
+    }
+    
+    try:
+        response = requests.get(schedule_url, params=schedule_params, headers=get_safe_headers(), timeout=12)
+        if response.status_code != 200:
+            print(f"❌ 賽程基本 API 請求失敗，狀態碼: {response.status_code}")
+            return None
+        schedule_data = response.json()
+    except Exception as e:
+        print(f"❌ 抓取基本賽程時發生異常: {e}")
+        return None
+        
+    dates = schedule_data.get("dates", [])
+    if not dates:
+        return pd.DataFrame()  # 當天無賽事
+        
+    games_list = []
+    base_games = dates[0].get("games", [])
+    print(f" [Docker 備援防禦啟動] 成功獲取基本賽程，開始穿透 {len(base_games)} 場比賽的 Boxscore & Linescore 數據...")
+    
+    # 🌟 步驟 2：疊代每場比賽，呼叫獨立端點抓取詳細數據
+    for idx, base_game in enumerate(base_games):
+        game_id = base_game.get("gamePk")
+        teams = base_game.get("teams", {})
+        away_team = teams.get("away", {})
+        home_team = teams.get("home", {})
+        
+        # 預設基本變數
+        away_pitcher_name, away_pitcher_id = "TBD", 0
+        home_pitcher_name, home_pitcher_id = "TBD", 0
+        current_inning = 0
+        inning_state = "Scheduled"
+        
+        # 預設客隊先發投手當場數據變數
+        away_pitcher_ip = "0.0"
+        away_pitcher_h = away_pitcher_er = away_pitcher_k = away_pitcher_bb = 0
+        
+        # 預設主隊先發投手當場數據變數
+        home_pitcher_ip = "0.0"
+        home_pitcher_h = home_pitcher_er = home_pitcher_k = home_pitcher_bb = 0
+        
+        # 隨機微幅等待（0.2 ~ 0.5 秒），確保安全穿透
+        time.sleep(random.uniform(0.2, 0.5))
+        
+        # 💡 子步驟 A：呼叫單場 boxscore 輕量端點（抓先發投手 + 投球數據）
+        boxscore_url = f"https://{domain}/api/v1/game/{game_id}/boxscore"
+        try:
+            box_res = requests.get(boxscore_url, headers=get_safe_headers(), timeout=10)
+            if box_res.status_code == 200:
+                box_data = box_res.json()
+                box_teams = box_data.get("teams", {})
+                
+                # --- 穿透客隊先發與數據 ---
+                away_box = box_teams.get("away", {})
+                away_pitchers_list = away_box.get("pitchers", [])
+                if away_pitchers_list:
+                    first_away_pitcher_id = away_pitchers_list[0]
+                    away_pitcher_id = first_away_pitcher_id
+                    
+                    # 撈取名字
+                    player_node = away_box.get("players", {}).get(f"ID{first_away_pitcher_id}", {})
+                    away_pitcher_name = player_node.get("person", {}).get("fullName", "TBD")
+                    
+                    # 撈取當場投球數據統計
+                    pitching_stats = player_node.get("stats", {}).get("pitching", {})
+                    if pitching_stats:
+                        away_pitcher_ip = pitching_stats.get("inningsPitched", "0.0")
+                        away_pitcher_h = int(pitching_stats.get("hits", 0))
+                        away_pitcher_er = int(pitching_stats.get("earnedRuns", 0))
+                        away_pitcher_k = int(pitching_stats.get("strikeOuts", 0))
+                        away_pitcher_bb = int(pitching_stats.get("baseOnBalls", 0))
+                    
+                # --- 穿透主隊先發與數據 ---
+                home_box = box_teams.get("home", {})
+                home_pitchers_list = home_box.get("pitchers", [])
+                if home_pitchers_list:
+                    first_home_pitcher_id = home_pitchers_list[0]
+                    home_pitcher_id = first_home_pitcher_id
+                    
+                    # 撈取名字
+                    player_node = home_box.get("players", {}).get(f"ID{first_home_pitcher_id}", {})
+                    home_pitcher_name = player_node.get("person", {}).get("fullName", "TBD")
+                    
+                    # 撈取當場投球數據統計
+                    pitching_stats = player_node.get("stats", {}).get("pitching", {})
+                    if pitching_stats:
+                        home_pitcher_ip = pitching_stats.get("inningsPitched", "0.0")
+                        home_pitcher_h = int(pitching_stats.get("hits", 0))
+                        home_pitcher_er = int(pitching_stats.get("earnedRuns", 0))
+                        home_pitcher_k = int(pitching_stats.get("strikeOuts", 0))
+                        home_pitcher_bb = int(pitching_stats.get("baseOnBalls", 0))
+                        
+        except Exception as e:
+            # 降級防禦：若 boxscore 異常，保留預設值跳過，確保整張大表不崩潰
+            pass
+
+        # 💡 子步驟 B：呼叫單場 linescore 輕量端點（抓即時局數與局半）
+        linescore_url = f"https://{domain}/api/v1/game/{game_id}/linescore"
+        try:
+            line_res = requests.get(linescore_url, headers=get_safe_headers(), timeout=10)
+            if line_res.status_code == 200:
+                line_data = line_res.json()
+                current_inning = line_data.get("currentInning", 0)
+                
+                state = line_data.get("inningState")         # Top / Bottom / End / Middle
+                ordinal = line_data.get("currentInningOrdinal") # 1st / 5th / 9th
+                
+                if state and ordinal:
+                    inning_state = f"{state} {ordinal}"
+                elif base_game.get("status", {}).get("abstractGameState") == "Final":
+                    inning_state = "Final"
+        except Exception as e:
+            pass
+
+        # 組合出包含先發投手詳細當場投球數據的 25 個完整欄位
+        games_list.append({
+            "Game_Date": game_date,
+            "Game_ID": game_id,
+            "Away_Team_Name": away_team.get("team", {}).get("name"),
+            "Home_Team_Name": home_team.get("team", {}).get("name"),
+            "Away_Started_Pitcher_Name": away_pitcher_name,
+            "Away_Started_Pitcher_ID": int(away_pitcher_id),
+            "Home_Started_Pitcher_Name": home_pitcher_name,
+            "Home_Started_Pitcher_ID": int(home_pitcher_id),
+            
+            # 🌟 新增：客隊先發投手當場投球數據
+            "Away_Pitcher_IP": away_pitcher_ip,
+            "Away_Pitcher_H": away_pitcher_h,
+            "Away_Pitcher_ER": away_pitcher_er,
+            "Away_Pitcher_K": away_pitcher_k,
+            "Away_Pitcher_BB": away_pitcher_bb,
+            
+            # 🌟 新增：主隊先發投手當場投球數據
+            "Home_Pitcher_IP": home_pitcher_ip,
+            "Home_Pitcher_H": home_pitcher_h,
+            "Home_Pitcher_ER": home_pitcher_er,
+            "Home_Pitcher_K": home_pitcher_k,
+            "Home_Pitcher_BB": home_pitcher_bb,
+            
+            "Away_Score": away_team.get("score", 0),
+            "Home_Score": home_team.get("score", 0),
+            "Game_State": base_game.get("status", {}).get("detailedState"),
+            "Current_Inning": int(current_inning),
+            "Inning_State": inning_state,
+            "Venue_Name": base_game.get("venue", {}).get("name"),
+            "Start_Time_UTC": base_game.get("gameDate")
+        })
+        
+    return pd.DataFrame(games_list)
+
+
 
 # ==============================================================================
 # 🎮 測試執行
@@ -347,8 +463,8 @@ if __name__ == "__main__":
         for _, row in df_games.iterrows():
             away_pid = row["Away_Started_Pitcher_ID"]
             home_pid = row["Home_Started_Pitcher_ID"]
-            if away_pid and int(away_pid) != 0: pitcher_ids_set.add(int(away_pid))
-            if home_pid and int(home_pid) != 0: pitcher_ids_set.add(int(home_pid))
+            #if away_pid and int(away_pid) != 0: pitcher_ids_set.add(int(away_pid))
+            #if home_pid and int(home_pid) != 0: pitcher_ids_set.add(int(home_pid))
             
         print(f"🎯 經交叉比對，當日共需穿透抓取 {len(pitcher_ids_set)} 位先發投手的賽季數據...")
         
@@ -409,3 +525,4 @@ if __name__ == "__main__":
             print("⚠️ 未收集到任何有效的投手數據，跳過 pitcher_data 工作表更新。")
             
         print("\n🏁 === MLB 每日數據自動化同步流水線 順利執行完畢 ===")
+
